@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>MCP lab agent</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:0;display:flex;height:100vh}
+ main{flex:1;display:flex;flex-direction:column;padding:16px}
+ #log{flex:1;overflow:auto;border:1px solid #ddd;padding:8px;background:#fafafa}
+ .ev{font-family:ui-monospace,monospace;font-size:12px;margin:3px 0;white-space:pre-wrap}
+ .err{color:#b00020}.ok{color:#1b5e20}.you{font-weight:600}
+ aside{width:360px;border-left:1px solid #ddd;padding:16px;font-size:13px}
+ form{display:flex;gap:8px;margin-top:8px} input{flex:1;padding:6px}
+ #dbg{flex-direction:column;align-items:stretch}
+</style>
+<script src="/static/msal-browser.min.js"></script>
+</head><body>
+<main><h3>MCP lab agent</h3><div id="log"></div>
+ <form id="f"><input id="q" placeholder="Ask something, e.g. Who am I?" autocomplete="off"><button>Send</button></form></main>
+<aside><button id="login">Sign in</button> <button id="signout" title="Clear this app's cookies and storage, then sign out of Microsoft">Sign out</button> <button id="disconnect" title="Remove your tool sign-ins held by Unity Gateway">Disconnect tools</button> <button id="egress">Check egress</button>
+ <h4>Identity</h4><pre id="who">not signed in</pre><div id="signin"></div>
+ <h4>Debug: call a tool directly</h4>
+ <div style="display:flex;gap:6px"><select id="tsel" style="flex:1" title="Tools the gateway offers you"><option value="">Available tools…</option></select><button id="trefresh" type="button" title="Refresh the tool list">↻</button></div>
+ <form id="dbg"><input id="tname" placeholder="tool name, e.g. admin_reset" autocomplete="off"><input id="targs" placeholder='{"text": "hello"}' autocomplete="off"><input id="tsvc" placeholder="service (optional), e.g. mcp_obo_lab.mcp.mcp_lab_atlassian" autocomplete="off"><button>Call tool</button></form></aside>
+<script>
+let pca, account, cfg;
+let ready = false;
+const $ = (id) => document.getElementById(id);
+function line(cls, text){ const d = document.createElement('div'); d.className = 'ev ' + cls; d.textContent = text; $('log').appendChild(d); $('log').scrollTop = 1e9; }
+async function boot(){
+  try {
+    cfg = await (await fetch('/api/config')).json();
+    pca = new msal.PublicClientApplication({auth:{clientId: cfg.frontendClientId, authority: 'https://login.microsoftonline.com/' + cfg.tenantId, redirectUri: location.origin + '/'}, cache:{cacheLocation:'sessionStorage'}});
+    await pca.initialize(); const back = await pca.handleRedirectPromise();
+    account = (back && back.account) || pca.getAllAccounts()[0]; $('who').textContent = account ? 'signed in: ' + account.username : 'not signed in';
+    ready = true;
+    if (account && location.pathname === '/tools-callback') await finishAppSignIn();
+    if (account) loadTools();
+  } catch (e) { $('who').textContent = 'startup failed: ' + e; line('err', 'startup failed: ' + e); }
+}
+async function userToken(forceRefresh = false){
+  const req = {scopes: [cfg.backendScope], account, forceRefresh};
+  try { return (await pca.acquireTokenSilent(req)).accessToken; } catch (e) { await pca.acquireTokenRedirect({scopes: [cfg.backendScope], account}); }
+}
+async function readBody(r){
+  const text = await r.text();
+  try { return JSON.parse(text); } catch (e) { return {detail: 'non-JSON response (HTTP ' + r.status + '): ' + text.slice(0, 200)}; }
+}
+async function postChat(q, forceRefresh){
+  return fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json', 'Authorization':'Bearer ' + await userToken(forceRefresh)}, body: JSON.stringify({message: q})});
+}
+let pendingPopup = null;  // a sign-in the browser blocked on load; retried inside the user's next Send click
+function watchPopup(w){ if (!w) return; const t = setInterval(() => { if (w.closed) { clearInterval(t); loadTools(); } }, 1000); }
+function autoPopup(url, service){
+  // Browsers only allow pop-ups from a user action, unless the site is allowed (browser setting or enterprise policy).
+  if (!url || !url.startsWith('https://') || sessionStorage.getItem('popupTried:' + service)) return;
+  sessionStorage.setItem('popupTried:' + service, '1');
+  const w = window.open(url, 'mcp-login', 'popup,width=640,height=760');
+  if (!w) { pendingPopup = url; line('', 'sign-in pop-up for ' + service.split('.').pop() + ' was blocked: it opens with your next message (or use the link)'); return; }
+  line('', 'opened the sign-in pop-up for ' + service.split('.').pop()); watchPopup(w);
+}
+function addSignIn(url, svc){
+  if (!url || !url.startsWith('https://') || Array.from($('signin').querySelectorAll('a')).some(x => x.href === url)) return;
+  const a = document.createElement('a'); a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+  a.textContent = 'Sign in to tools' + (svc ? ' (' + svc + ')' : ''); a.style.display = 'block';
+  // the gateway's OAuth callback hands the code back through window.opener, so open a child popup (trusted host only)
+  a.onclick = (e) => { e.preventDefault(); watchPopup(window.open(url, 'mcp-login', 'popup,width=640,height=760')); };
+  $('signin').appendChild(a);
+}
+const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+async function startAppSignIn(tool){
+  // The app runs the code flow itself and Databricks redeems the code: prompt=none (Entra SSO) needs no UI at all;
+  // prompt=consent (Atlassian) is a full-page redirect to the provider's consent screen and back, with no popup.
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  sessionStorage.setItem('signin:' + state, JSON.stringify({service: tool.service, verifier}));
+  if (tool.prompt === 'none') sessionStorage.setItem('silentTried:' + tool.service, '1');  // one silent attempt per tab session
+  const q = new URLSearchParams({client_id: tool.clientId, response_type: 'code', redirect_uri: location.origin + '/tools-callback',
+    scope: tool.scope, prompt: tool.prompt, code_challenge: challenge, code_challenge_method: 'S256', state});
+  if (tool.prompt === 'none') q.set('login_hint', account.username);
+  if (tool.resource) q.set('resource', tool.resource);
+  location.assign(tool.authorizeUrl + '?' + q);
+}
+async function finishAppSignIn(){
+  const p = new URLSearchParams(location.search); history.replaceState(null, '', '/');
+  const key = 'signin:' + p.get('state'); const pending = JSON.parse(sessionStorage.getItem(key) || 'null'); sessionStorage.removeItem(key);
+  if (!pending) { line('err', 'tool sign-in: unknown or expired state'); return; }
+  const svc = pending.service.split('.').pop();
+  if (p.get('error')) { line('err', 'tool sign-in ' + svc + ': ' + p.get('error') + (p.get('error_description') ? ' (' + p.get('error_description').slice(0, 160) + ')' : '')); return; }
+  try {
+    const r = await fetch('/api/tools/connect', {method:'POST', headers:{'Content-Type':'application/json', 'Authorization':'Bearer ' + await userToken(false)},
+      body: JSON.stringify({service: pending.service, code: p.get('code'), verifier: pending.verifier, redirect_uri: location.origin + '/tools-callback'})});
+    const body = await readBody(r);
+    line(body.ok ? 'ok' : 'err', 'tool sign-in ' + svc + ': ' + (body.message || body.detail || ('HTTP ' + r.status)));
+  } catch (err) { line('err', 'tool sign-in ' + svc + ' failed: ' + err); }
+}
+function addConnect(tool){
+  const svc = tool.service.split('.').pop();
+  if (Array.from($('signin').querySelectorAll('button')).some(b => b.dataset.service === tool.service)) return;
+  const b = document.createElement('button'); b.textContent = 'Connect ' + svc; b.dataset.service = tool.service; b.style.display = 'block';
+  b.onclick = () => startAppSignIn(tool); $('signin').appendChild(b);
+}
+async function loadTools(){
+  if (!ready) return;
+  try {
+    const r = await fetch('/api/tools', {headers: {'Authorization': 'Bearer ' + await userToken(false)}});
+    const body = await readBody(r); const sel = $('tsel');
+    sel.replaceChildren(new Option('Available tools…', ''));
+    const groups = {};
+    for (const t of (body.tools || [])) (groups[t.service] = groups[t.service] || []).push(t);
+    for (const [svc, ts] of Object.entries(groups)) {
+      const g = document.createElement('optgroup'); g.label = svc.split('.').pop();
+      for (const t of ts) { const o = new Option(t.name, JSON.stringify({name: t.name, service: svc})); o.title = t.description || ''; g.appendChild(o); }
+      sel.appendChild(g);
+    }
+    const appSignIn = (svc) => (cfg.signInTools || []).find(t => t.service === svc);
+    for (const e of (body.errors || [])) {
+      line('err', 'tools ' + (e.service || '') + ': ' + e.message);
+      const tool = e.code === -32006 && appSignIn(e.service);
+      if (tool && tool.prompt !== 'none') addConnect(tool);  // redirect sign-in replaces the gateway popup for this service
+      else { addSignIn(e.sign_in_url, (e.service || '').split('.').pop()); if (e.code === -32006) autoPopup(e.sign_in_url, e.service || ''); }
+    }
+    if (body.detail) line('err', 'tool list HTTP ' + r.status + ': ' + body.detail);
+    const silent = (body.errors || []).map(e => e.code === -32006 && appSignIn(e.service)).find(t => t && t.prompt === 'none' && !sessionStorage.getItem('silentTried:' + t.service));
+    if (silent) { line('', 'signing in to ' + silent.service.split('.').pop() + ' silently…'); await startAppSignIn(silent); }
+  } catch (err) { line('err', 'tool list failed: ' + err); }
+}
+$('tsel').onchange = () => { if (!$('tsel').value) return; const v = JSON.parse($('tsel').value); $('tname').value = v.name; $('tsvc').value = v.service; };
+$('trefresh').onclick = () => loadTools();
+$('login').onclick = () => { if (ready) pca.loginRedirect({scopes: [cfg.backendScope]}); };
+$('signout').onclick = async () => {
+  if (!ready) return;
+  try { await fetch('/api/signout', {method:'POST'}); } catch (e) { line('err', 'clearing site data failed: ' + e); }  // Clear-Site-Data: cookies, storage, cache
+  if (account) pca.logoutRedirect({account, postLogoutRedirectUri: location.origin + '/'}); else location.reload();
+};
+$('disconnect').onclick = async () => {
+  if (!ready || !account) { line('err', 'sign in first'); return; }
+  try {
+    const r = await fetch('/api/tools/disconnect', {method:'POST', headers:{'Authorization':'Bearer ' + await userToken(false)}});
+    const body = await readBody(r);
+    if (body.error) line('err', 'disconnect: ' + body.error);
+    for (const x of (body.results || [])) line(x.ok ? 'ok' : 'err', 'disconnect ' + x.service.split('.').pop() + ': ' + x.message + (x.ok ? '' : ' [' + x.status + ']'));
+    if (body.detail) line('err', 'disconnect HTTP ' + r.status + ': ' + body.detail);
+    else line('', 'the gateway may keep using a removed sign-in for a few minutes');
+    $('signin').replaceChildren();
+    for (const t of (cfg.signInTools || [])) sessionStorage.removeItem('silentTried:' + t.service);  // re-arm silent sign-in
+    for (const k of Object.keys(sessionStorage)) if (k.startsWith('popupTried:')) sessionStorage.removeItem(k);  // and the automatic pop-up
+  } catch (err) { line('err', 'disconnect failed: ' + err); }
+};
+$('egress').onclick = async () => {
+  try { line('', 'egress ' + JSON.stringify(await (await fetch('/api/egress')).json())); }
+  catch (e) { line('err', 'egress failed: ' + e); }
+};
+$('dbg').onsubmit = async (e) => {
+  e.preventDefault(); if (!ready) return; const name = $('tname').value.trim(); if (!name) return;
+  let args = {};
+  try { if ($('targs').value.trim()) args = JSON.parse($('targs').value); } catch (err) { line('err', 'tool arguments are not valid JSON: ' + err); return; }
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) { line('err', 'tool arguments must be a JSON object'); return; }
+  const svc = $('tsvc').value.trim();
+  line('you', '> tool ' + name + (svc ? ' @' + svc : '') + ' ' + JSON.stringify(args));
+  try {
+    const r = await fetch('/api/tool', {method:'POST', headers:{'Content-Type':'application/json', 'Authorization':'Bearer ' + await userToken(false)}, body: JSON.stringify(svc ? {name, arguments: args, service: svc} : {name, arguments: args})});
+    const body = await readBody(r);
+    if (typeof body.text === 'string') line('ok', 'tool_result ' + name + ': ' + body.text.slice(0, 400));
+    else if (body.error) line('err', 'tool_error ' + name + ' [' + body.status + '/' + body.error.code + '] ' + body.error.message);
+    else line('err', 'tool call HTTP ' + r.status + ': ' + (body.detail || JSON.stringify(body)));
+  } catch (err) { line('err', 'tool call failed: ' + err); }
+};
+$('f').onsubmit = async (e) => {
+  e.preventDefault(); if (!ready) return; const q = $('q').value.trim(); if (!q) return; line('you', '> ' + q); $('q').value = '';
+  if (pendingPopup) { const u = pendingPopup; pendingPopup = null; watchPopup(window.open(u, 'mcp-login', 'popup,width=640,height=760')); }  // inside the Send click, so allowed
+  window.__lastTurn = {status: null, body: null};
+  $('signin').replaceChildren();
+  try {
+    let r = await postChat(q, false);
+    if (r.status === 401) { line('', 'token rejected (401), re-acquiring'); r = await postChat(q, true); }
+    const body = await readBody(r); window.__lastTurn = {status: r.status, body};
+    for (const ev of (body.events || [])) {
+      if (ev.type === 'tool_call') line('', 'tool_call ' + ev.name + ' ' + JSON.stringify(ev.arguments));
+      else if (ev.type === 'tool_result') line('ok', 'tool_result ' + ev.name + ': ' + ev.text.slice(0, 400));
+      else if (ev.type === 'tool_error' || ev.type === 'http_error' || ev.type === 'auth_error') {
+        const sc = [ev.status, ev.code].filter(x => x !== undefined && x !== null);
+        line('err', ev.type + ' ' + (ev.name || ev.source || '') + (sc.length ? ' [' + sc.join('/') + ']' : '') + ' ' + ev.message);
+        if (ev.type === 'auth_error' && /AADSTS65001/.test(ev.message || '')) {  // the backend's downstream permission was never consented
+          const b = document.createElement('button'); b.textContent = 'Grant consent';
+          b.onclick = () => pca.acquireTokenRedirect({scopes: [cfg.backendScope], account, prompt: 'consent'}); $('signin').appendChild(b);
+        }
+        if (ev.sign_in_url) addSignIn(ev.sign_in_url, (ev.name || '').startsWith('tools/list:') ? ev.name.slice('tools/list:'.length).split('.').pop() : '');
+      } else if (ev.type === 'tools_offered') {
+        if (ev.services) {
+          const groups = {};
+          for (const n of (ev.names || [])) { const s = (ev.services[n] || '?').split('.').pop(); (groups[s] = groups[s] || []).push(n); }
+          line('', 'tools_offered: ' + Object.entries(groups).map(([s, ns]) => s + ': ' + ns.join(', ')).join(' | '));
+        } else line('', 'tools_offered: ' + (ev.names || []).join(', '));
+      }
+      else line('', ev.type);
+    }
+    if (body.identity) $('who').textContent = JSON.stringify(body.identity, null, 2);
+    line('', (typeof body.answer === 'string' && body.answer) || body.detail || JSON.stringify(body));
+  } catch (err) {
+    window.__lastTurn = {status: 'error', body: {detail: String(err)}};
+    line('err', 'turn failed: ' + err);
+  }
+};
+boot();
+</script>
+</body></html>
